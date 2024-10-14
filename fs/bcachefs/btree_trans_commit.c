@@ -609,14 +609,6 @@ static noinline int bch2_trans_commit_run_gc_triggers(struct btree_trans *trans)
 	return 0;
 }
 
-static struct bversion journal_pos_to_bversion(struct journal_res *res, unsigned offset)
-{
-	return (struct bversion) {
-		.hi = res->seq >> 32,
-		.lo = (res->seq << 32) | (res->offset + offset),
-	};
-}
-
 static inline int
 bch2_trans_commit_write_locked(struct btree_trans *trans, unsigned flags,
 			       struct btree_insert_entry **stopped_at,
@@ -632,7 +624,7 @@ bch2_trans_commit_write_locked(struct btree_trans *trans, unsigned flags,
 
 	if (race_fault()) {
 		trace_and_count(c, trans_restart_fault_inject, trans, trace_ip);
-		return btree_trans_restart_nounlock(trans, BCH_ERR_transaction_restart_fault_inject);
+		return btree_trans_restart(trans, BCH_ERR_transaction_restart_fault_inject);
 	}
 
 	/*
@@ -684,10 +676,10 @@ bch2_trans_commit_write_locked(struct btree_trans *trans, unsigned flags,
 	    !(flags & BCH_TRANS_COMMIT_no_journal_res)) {
 		if (bch2_journal_seq_verify)
 			trans_for_each_update(trans, i)
-				i->k->k.version.lo = trans->journal_res.seq;
+				i->k->k.bversion.lo = trans->journal_res.seq;
 		else if (bch2_inject_invalid_keys)
 			trans_for_each_update(trans, i)
-				i->k->k.version = MAX_VERSION;
+				i->k->k.bversion = MAX_VERSION;
 	}
 
 	h = trans->hooks;
@@ -700,27 +692,20 @@ bch2_trans_commit_write_locked(struct btree_trans *trans, unsigned flags,
 
 	struct jset_entry *entry = trans->journal_entries;
 
-	if (likely(!(flags & BCH_TRANS_COMMIT_skip_accounting_apply))) {
-		percpu_down_read(&c->mark_lock);
+	percpu_down_read(&c->mark_lock);
+	for (entry = trans->journal_entries;
+	     entry != (void *) ((u64 *) trans->journal_entries + trans->journal_entries_u64s);
+	     entry = vstruct_next(entry))
+		if (entry->type == BCH_JSET_ENTRY_write_buffer_keys &&
+		    entry->start->k.type == KEY_TYPE_accounting) {
+			ret = bch2_accounting_trans_commit_hook(trans, bkey_i_to_accounting(entry->start), flags);
+			if (ret)
+				goto revert_fs_usage;
+		}
+	percpu_up_read(&c->mark_lock);
 
-		for (entry = trans->journal_entries;
-		     entry != (void *) ((u64 *) trans->journal_entries + trans->journal_entries_u64s);
-		     entry = vstruct_next(entry))
-			if (jset_entry_is_key(entry) && entry->start->k.type == KEY_TYPE_accounting) {
-				struct bkey_i_accounting *a = bkey_i_to_accounting(entry->start);
-
-				a->k.version = journal_pos_to_bversion(&trans->journal_res,
-								(u64 *) entry - (u64 *) trans->journal_entries);
-				BUG_ON(bversion_zero(a->k.version));
-				ret = bch2_accounting_mem_mod_locked(trans, accounting_i_to_s_c(a), false, false);
-				if (ret)
-					goto revert_fs_usage;
-			}
-		percpu_up_read(&c->mark_lock);
-
-		/* XXX: we only want to run this if deltas are nonzero */
-		bch2_trans_account_disk_usage_change(trans);
-	}
+	/* XXX: we only want to run this if deltas are nonzero */
+	bch2_trans_account_disk_usage_change(trans);
 
 	trans_for_each_update(trans, i)
 		if (btree_node_type_has_atomic_triggers(i->bkey_type)) {
@@ -733,6 +718,40 @@ bch2_trans_commit_write_locked(struct btree_trans *trans, unsigned flags,
 		ret = bch2_trans_commit_run_gc_triggers(trans);
 		if  (ret)
 			goto fatal_err;
+	}
+
+	trans_for_each_update(trans, i) {
+		enum bch_validate_flags invalid_flags = 0;
+
+		if (!(flags & BCH_TRANS_COMMIT_no_journal_res))
+			invalid_flags |= BCH_VALIDATE_write|BCH_VALIDATE_commit;
+
+		ret = bch2_bkey_validate(c, bkey_i_to_s_c(i->k),
+					 i->bkey_type, invalid_flags);
+		if (unlikely(ret)){
+			bch2_trans_inconsistent(trans, "invalid bkey on insert from %s -> %ps\n",
+						trans->fn, (void *) i->ip_allocated);
+			goto fatal_err;
+		}
+		btree_insert_entry_checks(trans, i);
+	}
+
+	for (struct jset_entry *i = trans->journal_entries;
+	     i != (void *) ((u64 *) trans->journal_entries + trans->journal_entries_u64s);
+	     i = vstruct_next(i)) {
+		enum bch_validate_flags invalid_flags = 0;
+
+		if (!(flags & BCH_TRANS_COMMIT_no_journal_res))
+			invalid_flags |= BCH_VALIDATE_write|BCH_VALIDATE_commit;
+
+		ret = bch2_journal_entry_validate(c, NULL, i,
+						  bcachefs_metadata_version_current,
+						  CPU_BIG_ENDIAN, invalid_flags);
+		if (unlikely(ret)) {
+			bch2_trans_inconsistent(trans, "invalid journal entry on insert from %s\n",
+						trans->fn);
+			goto fatal_err;
+		}
 	}
 
 	if (likely(!(flags & BCH_TRANS_COMMIT_no_journal_res))) {
@@ -794,13 +813,10 @@ revert_fs_usage:
 	for (struct jset_entry *entry2 = trans->journal_entries;
 	     entry2 != entry;
 	     entry2 = vstruct_next(entry2))
-		if (jset_entry_is_key(entry2) && entry2->start->k.type == KEY_TYPE_accounting) {
-			struct bkey_s_accounting a = bkey_i_to_s_accounting(entry2->start);
-
-			bch2_accounting_neg(a);
-			bch2_accounting_mem_mod_locked(trans, a.c, false, false);
-			bch2_accounting_neg(a);
-		}
+		if (entry2->type == BCH_JSET_ENTRY_write_buffer_keys &&
+		    entry2->start->k.type == KEY_TYPE_accounting)
+			bch2_accounting_trans_commit_revert(trans,
+					bkey_i_to_accounting(entry2->start), flags);
 	percpu_up_read(&c->mark_lock);
 	return ret;
 }
@@ -1011,6 +1027,10 @@ int __bch2_trans_commit(struct btree_trans *trans, unsigned flags)
 	bch2_trans_verify_not_unlocked(trans);
 	bch2_trans_verify_not_in_restart(trans);
 
+	ret = trans_maybe_inject_restart(trans, _RET_IP_);
+	if (unlikely(ret))
+		goto out_reset;
+
 	if (!trans->nr_updates &&
 	    !trans->journal_entries_u64s)
 		goto out_reset;
@@ -1018,40 +1038,6 @@ int __bch2_trans_commit(struct btree_trans *trans, unsigned flags)
 	ret = bch2_trans_commit_run_triggers(trans);
 	if (ret)
 		goto out_reset;
-
-	trans_for_each_update(trans, i) {
-		enum bch_validate_flags invalid_flags = 0;
-
-		if (!(flags & BCH_TRANS_COMMIT_no_journal_res))
-			invalid_flags |= BCH_VALIDATE_write|BCH_VALIDATE_commit;
-
-		ret = bch2_bkey_validate(c, bkey_i_to_s_c(i->k),
-					 i->bkey_type, invalid_flags);
-		if (unlikely(ret)){
-			bch2_trans_inconsistent(trans, "invalid bkey on insert from %s -> %ps\n",
-						trans->fn, (void *) i->ip_allocated);
-			return ret;
-		}
-		btree_insert_entry_checks(trans, i);
-	}
-
-	for (struct jset_entry *i = trans->journal_entries;
-	     i != (void *) ((u64 *) trans->journal_entries + trans->journal_entries_u64s);
-	     i = vstruct_next(i)) {
-		enum bch_validate_flags invalid_flags = 0;
-
-		if (!(flags & BCH_TRANS_COMMIT_no_journal_res))
-			invalid_flags |= BCH_VALIDATE_write|BCH_VALIDATE_commit;
-
-		ret = bch2_journal_entry_validate(c, NULL, i,
-						  bcachefs_metadata_version_current,
-						  CPU_BIG_ENDIAN, invalid_flags);
-		if (unlikely(ret)) {
-			bch2_trans_inconsistent(trans, "invalid journal entry on insert from %s\n",
-						trans->fn);
-			return ret;
-		}
-	}
 
 	if (unlikely(!test_bit(BCH_FS_may_go_rw, &c->flags))) {
 		ret = do_bch2_trans_commit_to_journal_replay(trans);

@@ -293,6 +293,8 @@ do {									\
 
 #define bch_info(c, fmt, ...) \
 	bch2_print(c, KERN_INFO bch2_fmt(c, fmt), ##__VA_ARGS__)
+#define bch_info_ratelimited(c, fmt, ...) \
+	bch2_print_ratelimited(c, KERN_INFO bch2_fmt(c, fmt), ##__VA_ARGS__)
 #define bch_notice(c, fmt, ...) \
 	bch2_print(c, KERN_NOTICE bch2_fmt(c, fmt), ##__VA_ARGS__)
 #define bch_warn(c, fmt, ...) \
@@ -350,6 +352,12 @@ do {									\
 do {									\
 	if ((c)->opts.verbose)						\
 		bch_info(c, fmt, ##__VA_ARGS__);			\
+} while (0)
+
+#define bch_verbose_ratelimited(c, fmt, ...)				\
+do {									\
+	if ((c)->opts.verbose)						\
+		bch_info_ratelimited(c, fmt, ##__VA_ARGS__);		\
 } while (0)
 
 #define pr_verbose_init(opts, fmt, ...)					\
@@ -594,6 +602,7 @@ struct bch_dev {
 #define BCH_FS_FLAGS()			\
 	x(new_fs)			\
 	x(started)			\
+	x(clean_recovery)		\
 	x(btree_running)		\
 	x(accounting_replay_done)	\
 	x(may_go_rw)			\
@@ -678,6 +687,7 @@ struct btree_trans_buf {
 	((subvol_inum) { BCACHEFS_ROOT_SUBVOL,	BCACHEFS_ROOT_INO })
 
 #define BCH_WRITE_REFS()						\
+	x(journal)							\
 	x(trans)							\
 	x(write)							\
 	x(promote)							\
@@ -776,7 +786,7 @@ struct bch_fs {
 		unsigned	nsec_per_time_unit;
 		u64		features;
 		u64		compat;
-		unsigned long	errors_silent[BITS_TO_LONGS(BCH_SB_ERR_MAX)];
+		unsigned long	errors_silent[BITS_TO_LONGS(BCH_FSCK_ERR_MAX)];
 		u64		btrees_lost_data;
 	}			sb;
 
@@ -1050,6 +1060,7 @@ struct bch_fs {
 	u64			recovery_passes_complete;
 	/* never rewinds version of curr_recovery_pass */
 	enum bch_recovery_pass	recovery_pass_done;
+	spinlock_t		recovery_pass_lock;
 	struct semaphore	online_fsck_mutex;
 
 	/* DEBUG JUNK */

@@ -25,9 +25,8 @@
 
 static void bch2_btree_node_header_to_text(struct printbuf *out, struct btree_node *bn)
 {
-	prt_printf(out, "btree=%s l=%u seq %llux\n",
-		   bch2_btree_id_str(BTREE_NODE_ID(bn)),
-		   (unsigned) BTREE_NODE_LEVEL(bn), bn->keys.seq);
+	bch2_btree_id_level_to_text(out, BTREE_NODE_ID(bn), BTREE_NODE_LEVEL(bn));
+	prt_printf(out, " seq %llux\n", bn->keys.seq);
 	prt_str(out, "min: ");
 	bch2_bpos_to_text(out, bn->min_key);
 	prt_newline(out);
@@ -1195,6 +1194,10 @@ int bch2_btree_node_read_done(struct bch_fs *c, struct bch_dev *ca,
 	set_btree_bset(b, b->set, &b->data->keys);
 
 	b->nr = bch2_key_sort_fix_overlapping(c, &sorted->keys, iter);
+	memset((uint8_t *)(sorted + 1) + b->nr.live_u64s * sizeof(u64), 0,
+			btree_buf_bytes(b) -
+			sizeof(struct btree_node) -
+			b->nr.live_u64s * sizeof(u64));
 
 	u64s = le16_to_cpu(sorted->keys.u64s);
 	*sorted = *b->data;
@@ -1219,7 +1222,7 @@ int bch2_btree_node_read_done(struct bch_fs *c, struct bch_dev *ca,
 		ret = bch2_bkey_val_validate(c, u.s_c, READ);
 		if (ret == -BCH_ERR_fsck_delete_bkey ||
 		    (bch2_inject_invalid_keys &&
-		     !bversion_cmp(u.k->version, MAX_VERSION))) {
+		     !bversion_cmp(u.k->bversion, MAX_VERSION))) {
 			btree_keys_account_key_drop(&b->nr, 0, k);
 
 			i->u64s = cpu_to_le16(le16_to_cpu(i->u64s) - k->u64s);
@@ -1343,9 +1346,11 @@ start:
 	    !btree_node_read_error(b) &&
 	    c->curr_recovery_pass != BCH_RECOVERY_PASS_scan_for_btree_nodes) {
 		printbuf_reset(&buf);
-		bch2_bpos_to_text(&buf, b->key.k.p);
-		bch_err_ratelimited(c, "%s: rewriting btree node at btree=%s level=%u %s due to error",
-			 __func__, bch2_btree_id_str(b->c.btree_id), b->c.level, buf.buf);
+		bch2_btree_id_level_to_text(&buf, b->c.btree_id, b->c.level);
+		prt_str(&buf, " ");
+		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&b->key));
+		bch_err_ratelimited(c, "%s: rewriting btree node at due to error\n  %s",
+				    __func__, buf.buf);
 
 		bch2_btree_node_rewrite_async(c, b);
 	}
@@ -1834,10 +1839,11 @@ static void btree_node_write_done(struct bch_fs *c, struct btree *b)
 	struct btree_trans *trans = bch2_trans_get(c);
 
 	btree_node_lock_nopath_nofail(trans, &b->c, SIX_LOCK_read);
+
+	/* we don't need transaction context anymore after we got the lock. */
+	bch2_trans_put(trans);
 	__btree_node_write_done(c, b);
 	six_unlock_read(&b->c.lock);
-
-	bch2_trans_put(trans);
 }
 
 static void btree_node_write_work(struct work_struct *work)

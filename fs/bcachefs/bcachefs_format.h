@@ -217,13 +217,13 @@ struct bkey {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 	__u8		pad[1];
 
-	struct bversion	version;
+	struct bversion	bversion;
 	__u32		size;		/* extent size, in sectors */
 	struct bpos	p;
 #elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 	struct bpos	p;
 	__u32		size;		/* extent size, in sectors */
-	struct bversion	version;
+	struct bversion	bversion;
 
 	__u8		pad[1];
 #endif
@@ -328,8 +328,8 @@ enum bch_bkey_fields {
 		bkey_format_field(OFFSET,	p.offset),		\
 		bkey_format_field(SNAPSHOT,	p.snapshot),		\
 		bkey_format_field(SIZE,		size),			\
-		bkey_format_field(VERSION_HI,	version.hi),		\
-		bkey_format_field(VERSION_LO,	version.lo),		\
+		bkey_format_field(VERSION_HI,	bversion.hi),		\
+		bkey_format_field(VERSION_LO,	bversion.lo),		\
 	},								\
 })
 
@@ -499,8 +499,6 @@ struct bch_sb_field {
 #include "disk_groups_format.h"
 #include "extents_format.h"
 #include "ec_format.h"
-#include "dirent_format.h"
-#include "disk_groups_format.h"
 #include "inode_format.h"
 #include "journal_seq_blacklist_format.h"
 #include "logged_ops_format.h"
@@ -678,7 +676,8 @@ struct bch_sb_field_ext {
 	x(disk_accounting_v2,		BCH_VERSION(1,  9))		\
 	x(disk_accounting_v3,		BCH_VERSION(1, 10))		\
 	x(disk_accounting_inum,		BCH_VERSION(1, 11))		\
-	x(rebalance_work_acct_fix,	BCH_VERSION(1, 12))
+	x(rebalance_work_acct_fix,	BCH_VERSION(1, 12))		\
+	x(inode_has_child_snapshots,	BCH_VERSION(1, 13))
 
 enum bcachefs_metadata_version {
 	bcachefs_metadata_version_min = 9,
@@ -1220,6 +1219,15 @@ struct jset_entry_log {
 	u8			d[];
 } __packed __aligned(8);
 
+static inline unsigned jset_entry_log_msg_bytes(struct jset_entry_log *l)
+{
+	unsigned b = vstruct_bytes(&l->entry) - offsetof(struct jset_entry_log, d);
+
+	while (b && !l->d[b - 1])
+		--b;
+	return b;
+}
+
 struct jset_entry_datetime {
 	struct jset_entry	entry;
 	__le64			seconds;
@@ -1360,6 +1368,8 @@ static inline bool btree_id_is_alloc(enum btree_id id)
 	case BTREE_ID_need_discard:
 	case BTREE_ID_freespace:
 	case BTREE_ID_bucket_gens:
+	case BTREE_ID_lru:
+	case BTREE_ID_accounting:
 		return true;
 	default:
 		return false;

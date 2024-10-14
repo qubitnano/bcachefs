@@ -22,9 +22,9 @@ struct find_btree_nodes_worker {
 
 static void found_btree_node_to_text(struct printbuf *out, struct bch_fs *c, const struct found_btree_node *n)
 {
-	prt_printf(out, "%s l=%u seq=%u journal_seq=%llu cookie=%llx ",
-		   bch2_btree_id_str(n->btree_id), n->level, n->seq,
-		   n->journal_seq, n->cookie);
+	bch2_btree_id_level_to_text(out, n->btree_id, n->level);
+	prt_printf(out, " seq=%u journal_seq=%llu cookie=%llx ",
+		   n->seq, n->journal_seq, n->cookie);
 	bch2_bpos_to_text(out, n->min_key);
 	prt_str(out, "-");
 	bch2_bpos_to_text(out, n->max_key);
@@ -171,6 +171,9 @@ static void try_read_btree_node(struct find_btree_nodes *f, struct bch_dev *ca,
 	if (BTREE_NODE_LEVEL(bn) >= BTREE_MAX_DEPTH)
 		return;
 
+	if (BTREE_NODE_ID(bn) >= BTREE_ID_NR_MAX)
+		return;
+
 	rcu_read_lock();
 	struct found_btree_node n = {
 		.btree_id	= BTREE_NODE_ID(bn),
@@ -275,7 +278,7 @@ static int read_btree_nodes(struct find_btree_nodes *f)
 		w->ca		= ca;
 
 		t = kthread_run(read_btree_nodes_worker, w, "read_btree_nodes/%s", ca->name);
-		ret = IS_ERR_OR_NULL(t);
+		ret = PTR_ERR_OR_ZERO(t);
 		if (ret) {
 			percpu_ref_put(&ca->io_ref);
 			closure_put(&cl);
@@ -496,7 +499,9 @@ int bch2_get_scanned_nodes(struct bch_fs *c, enum btree_id btree,
 	if (c->opts.verbose) {
 		struct printbuf buf = PRINTBUF;
 
-		prt_printf(&buf, "recovering %s l=%u ", bch2_btree_id_str(btree), level);
+		prt_str(&buf, "recovery ");
+		bch2_btree_id_level_to_text(&buf, btree, level);
+		prt_str(&buf, " ");
 		bch2_bpos_to_text(&buf, node_min);
 		prt_str(&buf, " - ");
 		bch2_bpos_to_text(&buf, node_max);
